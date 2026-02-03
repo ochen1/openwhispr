@@ -17,6 +17,10 @@ const VAD_CONFIG = {
   ANALYSIS_INTERVAL: 50,
   // FFT size for frequency analysis
   FFT_SIZE: 2048,
+  // Padding to add before/after voice segments (in seconds)
+  SEGMENT_PADDING: 0.15,
+  // Minimum gap between voice segments to merge them (in seconds)
+  MERGE_GAP: 0.3,
 };
 
 const PLACEHOLDER_KEYS = {
@@ -59,6 +63,10 @@ class AudioManager {
     this.speechDuration = 0;
     this.lastVoiceTime = 0;
     this.onVADStateChange = null;
+    // Track voice activity segments for silence trimming
+    this.voiceSegments = [];
+    this.currentSegmentStart = null;
+    this.vadStartTime = null;
   }
 
   getCustomDictionaryPrompt() {
@@ -143,6 +151,9 @@ class AudioManager {
       this.voiceDetected = false;
       this.speechDuration = 0;
       this.lastVoiceTime = 0;
+      this.voiceSegments = [];
+      this.currentSegmentStart = null;
+      this.vadStartTime = Date.now();
 
       // Create buffer for frequency data
       const bufferLength = this.analyser.frequencyBinCount;
@@ -170,15 +181,41 @@ class AudioManager {
 
         // Check if voice is detected (above threshold)
         const isVoiceNow = this.currentAudioLevel > VAD_CONFIG.VOICE_THRESHOLD;
+        const currentTime = Date.now();
+        const elapsedSeconds = (currentTime - this.vadStartTime) / 1000;
 
         if (isVoiceNow) {
-          this.lastVoiceTime = Date.now();
+          this.lastVoiceTime = currentTime;
           if (!this.voiceDetected) {
             this.voiceDetected = true;
             logger.debug("Voice activity detected", { level: this.currentAudioLevel }, "vad");
           }
           // Accumulate speech duration
           this.speechDuration += VAD_CONFIG.ANALYSIS_INTERVAL / 1000;
+
+          // Track voice segment start
+          if (this.currentSegmentStart === null) {
+            this.currentSegmentStart = elapsedSeconds;
+          }
+        } else {
+          // Voice stopped - check if we should end the current segment
+          if (this.currentSegmentStart !== null) {
+            const silenceDuration = (currentTime - this.lastVoiceTime) / 1000;
+            // End segment if silence exceeds merge gap
+            if (silenceDuration > VAD_CONFIG.MERGE_GAP) {
+              const segmentEnd = (this.lastVoiceTime - this.vadStartTime) / 1000;
+              this.voiceSegments.push({
+                start: this.currentSegmentStart,
+                end: segmentEnd,
+              });
+              logger.debug(
+                "Voice segment recorded",
+                { start: this.currentSegmentStart, end: segmentEnd },
+                "vad"
+              );
+              this.currentSegmentStart = null;
+            }
+          }
         }
 
         // Notify about VAD state change
@@ -199,6 +236,21 @@ class AudioManager {
 
   // Stop VAD monitoring and clean up resources
   stopVADMonitoring() {
+    // Finalize any ongoing voice segment
+    if (this.currentSegmentStart !== null && this.vadStartTime) {
+      const segmentEnd = (Date.now() - this.vadStartTime) / 1000;
+      this.voiceSegments.push({
+        start: this.currentSegmentStart,
+        end: segmentEnd,
+      });
+      logger.debug(
+        "Final voice segment recorded",
+        { start: this.currentSegmentStart, end: segmentEnd },
+        "vad"
+      );
+      this.currentSegmentStart = null;
+    }
+
     if (this.vadIntervalId) {
       clearInterval(this.vadIntervalId);
       this.vadIntervalId = null;
@@ -221,11 +273,147 @@ class AudioManager {
       peakLevel: this.peakAudioLevel,
       voiceDetected: this.voiceDetected,
       speechDuration: this.speechDuration,
+      voiceSegments: [...this.voiceSegments],
     };
 
     logger.debug("VAD monitoring stopped", stats, "vad");
 
     return stats;
+  }
+
+  // Trim silence from audio blob based on VAD segments
+  // Returns { blob, duration } or null if no valid audio
+  async trimSilence(audioBlob, voiceSegments, totalDuration) {
+    // If no voice segments, return null (no valid audio)
+    if (!voiceSegments || voiceSegments.length === 0) {
+      logger.debug("No voice segments to trim", {}, "vad");
+      return null;
+    }
+
+    // Merge overlapping/adjacent segments and add padding
+    const mergedSegments = this.mergeVoiceSegments(voiceSegments, totalDuration);
+
+    if (mergedSegments.length === 0) {
+      return null;
+    }
+
+    // Calculate the trimmed duration
+    const trimmedDuration = mergedSegments.reduce((sum, seg) => sum + (seg.end - seg.start), 0);
+
+    logger.debug(
+      "Trimming audio",
+      {
+        originalDuration: totalDuration,
+        trimmedDuration,
+        segmentCount: mergedSegments.length,
+        segments: mergedSegments,
+      },
+      "vad"
+    );
+
+    // If trimmed duration is close to total, skip trimming (not worth it)
+    if (trimmedDuration >= totalDuration * 0.9) {
+      logger.debug("Skipping trim - audio is mostly speech", {}, "vad");
+      return { blob: audioBlob, duration: totalDuration };
+    }
+
+    try {
+      // Decode the audio blob
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+      // Calculate sample positions for each segment
+      const sampleRate = audioBuffer.sampleRate;
+      const channels = audioBuffer.numberOfChannels;
+
+      // Calculate total samples needed
+      let totalSamples = 0;
+      const sampleSegments = mergedSegments.map((seg) => {
+        const startSample = Math.floor(seg.start * sampleRate);
+        const endSample = Math.min(Math.floor(seg.end * sampleRate), audioBuffer.length);
+        const length = endSample - startSample;
+        totalSamples += length;
+        return { startSample, endSample, length };
+      });
+
+      // Create a new buffer with only the voiced segments
+      const trimmedBuffer = audioContext.createBuffer(channels, totalSamples, sampleRate);
+
+      // Copy audio data from each segment
+      for (let channel = 0; channel < channels; channel++) {
+        const sourceData = audioBuffer.getChannelData(channel);
+        const targetData = trimmedBuffer.getChannelData(channel);
+
+        let targetOffset = 0;
+        for (const seg of sampleSegments) {
+          for (let i = 0; i < seg.length; i++) {
+            if (seg.startSample + i < sourceData.length) {
+              targetData[targetOffset + i] = sourceData[seg.startSample + i];
+            }
+          }
+          targetOffset += seg.length;
+        }
+      }
+
+      // Convert back to WAV blob
+      const trimmedBlob = this.audioBufferToWav(trimmedBuffer);
+
+      await audioContext.close();
+
+      logger.info(
+        "Audio trimmed successfully",
+        {
+          originalSize: audioBlob.size,
+          trimmedSize: trimmedBlob.size,
+          originalDuration: totalDuration.toFixed(2),
+          trimmedDuration: trimmedDuration.toFixed(2),
+          reduction: ((1 - trimmedDuration / totalDuration) * 100).toFixed(1) + "%",
+        },
+        "vad"
+      );
+
+      return { blob: trimmedBlob, duration: trimmedDuration };
+    } catch (error) {
+      logger.error("Failed to trim audio", { error: error.message }, "vad");
+      // Return original blob on error
+      return { blob: audioBlob, duration: totalDuration };
+    }
+  }
+
+  // Merge voice segments and add padding
+  mergeVoiceSegments(segments, totalDuration) {
+    if (!segments || segments.length === 0) return [];
+
+    // Sort segments by start time
+    const sorted = [...segments].sort((a, b) => a.start - b.start);
+
+    // Add padding and merge overlapping segments
+    const merged = [];
+    let current = null;
+
+    for (const seg of sorted) {
+      // Add padding to segment
+      const paddedStart = Math.max(0, seg.start - VAD_CONFIG.SEGMENT_PADDING);
+      const paddedEnd = Math.min(totalDuration, seg.end + VAD_CONFIG.SEGMENT_PADDING);
+
+      if (!current) {
+        current = { start: paddedStart, end: paddedEnd };
+      } else if (paddedStart <= current.end + VAD_CONFIG.MERGE_GAP) {
+        // Merge with current segment
+        current.end = Math.max(current.end, paddedEnd);
+      } else {
+        // Start new segment
+        merged.push(current);
+        current = { start: paddedStart, end: paddedEnd };
+      }
+    }
+
+    if (current) {
+      merged.push(current);
+    }
+
+    return merged;
   }
 
   // Check if recording has sufficient audio content
@@ -328,7 +516,26 @@ class AudioManager {
         this.isProcessing = true;
         this.onStateChange?.({ isRecording: false, isProcessing: true });
 
-        await this.processAudio(audioBlob, { durationSeconds, vadStats });
+        // Trim silence from the audio before sending to API
+        let processedBlob = audioBlob;
+        let trimmedDurationSeconds = durationSeconds;
+        if (vadStats.voiceSegments && vadStats.voiceSegments.length > 0 && durationSeconds) {
+          const trimResult = await this.trimSilence(
+            audioBlob,
+            vadStats.voiceSegments,
+            durationSeconds
+          );
+          if (trimResult) {
+            processedBlob = trimResult.blob;
+            trimmedDurationSeconds = trimResult.duration;
+          }
+        }
+
+        await this.processAudio(processedBlob, {
+          durationSeconds: trimmedDurationSeconds,
+          originalDurationSeconds: durationSeconds,
+          vadStats,
+        });
 
         // Clean up stream
         stream.getTracks().forEach((track) => track.stop());
