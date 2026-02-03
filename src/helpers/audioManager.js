@@ -7,6 +7,18 @@ import { isSecureEndpoint } from "../utils/urlUtils";
 const SHORT_CLIP_DURATION_SECONDS = 2.5;
 const REASONING_CACHE_TTL = 30000; // 30 seconds
 
+// VAD (Voice Activity Detection) configuration
+const VAD_CONFIG = {
+  // RMS threshold for detecting voice activity (0-1 scale, typically 0.01-0.1)
+  VOICE_THRESHOLD: 0.04,
+  // Minimum duration of speech required (in seconds)
+  MIN_SPEECH_DURATION: 0.5,
+  // How often to analyze audio levels (in ms)
+  ANALYSIS_INTERVAL: 50,
+  // FFT size for frequency analysis
+  FFT_SIZE: 2048,
+};
+
 const PLACEHOLDER_KEYS = {
   openai: "your_openai_api_key_here",
   groq: "your_groq_api_key_here",
@@ -35,6 +47,18 @@ class AudioManager {
     this.recordingStartTime = null;
     this.reasoningAvailabilityCache = { value: false, expiresAt: 0 };
     this.cachedReasoningPreference = null;
+
+    // VAD-related properties
+    this.audioContext = null;
+    this.analyser = null;
+    this.audioSource = null;
+    this.vadIntervalId = null;
+    this.currentAudioLevel = 0;
+    this.peakAudioLevel = 0;
+    this.voiceDetected = false;
+    this.speechDuration = 0;
+    this.lastVoiceTime = 0;
+    this.onVADStateChange = null;
   }
 
   getCustomDictionaryPrompt() {
@@ -49,10 +73,18 @@ class AudioManager {
     return null;
   }
 
-  setCallbacks({ onStateChange, onError, onTranscriptionComplete }) {
+  setCallbacks({
+    onStateChange,
+    onError,
+    onTranscriptionComplete,
+    onVADStateChange,
+    onNoAudioDetected,
+  }) {
     this.onStateChange = onStateChange;
     this.onError = onError;
     this.onTranscriptionComplete = onTranscriptionComplete;
+    this.onVADStateChange = onVADStateChange;
+    this.onNoAudioDetected = onNoAudioDetected;
   }
 
   async getAudioConstraints() {
@@ -93,6 +125,118 @@ class AudioManager {
     return { audio: true };
   }
 
+  // Start VAD (Voice Activity Detection) monitoring
+  startVADMonitoring(stream) {
+    try {
+      // Create audio context and analyser for real-time audio level monitoring
+      this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = VAD_CONFIG.FFT_SIZE;
+      this.analyser.smoothingTimeConstant = 0.3;
+
+      this.audioSource = this.audioContext.createMediaStreamSource(stream);
+      this.audioSource.connect(this.analyser);
+
+      // Reset VAD state
+      this.currentAudioLevel = 0;
+      this.peakAudioLevel = 0;
+      this.voiceDetected = false;
+      this.speechDuration = 0;
+      this.lastVoiceTime = 0;
+
+      // Create buffer for frequency data
+      const bufferLength = this.analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      // Start periodic audio level analysis
+      this.vadIntervalId = setInterval(() => {
+        this.analyser.getByteFrequencyData(dataArray);
+
+        // Calculate RMS (Root Mean Square) for volume level
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const value = dataArray[i] / 255; // Normalize to 0-1
+          sum += value * value;
+        }
+        const rms = Math.sqrt(sum / bufferLength);
+
+        // Update current audio level (smoothed)
+        this.currentAudioLevel = this.currentAudioLevel * 0.7 + rms * 0.3;
+
+        // Track peak level
+        if (this.currentAudioLevel > this.peakAudioLevel) {
+          this.peakAudioLevel = this.currentAudioLevel;
+        }
+
+        // Check if voice is detected (above threshold)
+        const isVoiceNow = this.currentAudioLevel > VAD_CONFIG.VOICE_THRESHOLD;
+
+        if (isVoiceNow) {
+          this.lastVoiceTime = Date.now();
+          if (!this.voiceDetected) {
+            this.voiceDetected = true;
+            logger.debug("Voice activity detected", { level: this.currentAudioLevel }, "vad");
+          }
+          // Accumulate speech duration
+          this.speechDuration += VAD_CONFIG.ANALYSIS_INTERVAL / 1000;
+        }
+
+        // Notify about VAD state change
+        this.onVADStateChange?.({
+          audioLevel: this.currentAudioLevel,
+          peakLevel: this.peakAudioLevel,
+          voiceDetected: this.voiceDetected,
+          isVoiceActive: isVoiceNow,
+          speechDuration: this.speechDuration,
+        });
+      }, VAD_CONFIG.ANALYSIS_INTERVAL);
+
+      logger.debug("VAD monitoring started", { threshold: VAD_CONFIG.VOICE_THRESHOLD }, "vad");
+    } catch (error) {
+      logger.error("Failed to start VAD monitoring", { error: error.message }, "vad");
+    }
+  }
+
+  // Stop VAD monitoring and clean up resources
+  stopVADMonitoring() {
+    if (this.vadIntervalId) {
+      clearInterval(this.vadIntervalId);
+      this.vadIntervalId = null;
+    }
+
+    if (this.audioSource) {
+      this.audioSource.disconnect();
+      this.audioSource = null;
+    }
+
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
+    }
+
+    this.analyser = null;
+
+    // Capture final VAD stats before reset
+    const stats = {
+      peakLevel: this.peakAudioLevel,
+      voiceDetected: this.voiceDetected,
+      speechDuration: this.speechDuration,
+    };
+
+    logger.debug("VAD monitoring stopped", stats, "vad");
+
+    return stats;
+  }
+
+  // Check if recording has sufficient audio content
+  hasValidAudioContent() {
+    return (
+      this.voiceDetected &&
+      this.speechDuration >= VAD_CONFIG.MIN_SPEECH_DURATION &&
+      this.peakAudioLevel > VAD_CONFIG.VOICE_THRESHOLD
+    );
+  }
+
   async startRecording() {
     try {
       if (this.isRecording || this.isProcessing || this.mediaRecorder?.state === "recording") {
@@ -123,14 +267,18 @@ class AudioManager {
       this.recordingStartTime = Date.now();
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
 
+      // Start VAD monitoring for real-time audio level feedback
+      this.startVADMonitoring(stream);
+
       this.mediaRecorder.ondataavailable = (event) => {
         this.audioChunks.push(event.data);
       };
 
       this.mediaRecorder.onstop = async () => {
+        // Stop VAD monitoring and get final stats
+        const vadStats = this.stopVADMonitoring();
+
         this.isRecording = false;
-        this.isProcessing = true;
-        this.onStateChange?.({ isRecording: false, isProcessing: true });
 
         const audioBlob = new Blob(this.audioChunks, { type: this.recordingMimeType });
 
@@ -141,6 +289,7 @@ class AudioManager {
             blobSize: audioBlob.size,
             blobType: audioBlob.type,
             chunksCount: this.audioChunks.length,
+            vadStats,
           },
           "audio"
         );
@@ -149,7 +298,37 @@ class AudioManager {
           ? (Date.now() - this.recordingStartTime) / 1000
           : null;
         this.recordingStartTime = null;
-        await this.processAudio(audioBlob, { durationSeconds });
+
+        // Check if we have valid audio content using VAD
+        if (!vadStats.voiceDetected || vadStats.speechDuration < VAD_CONFIG.MIN_SPEECH_DURATION) {
+          logger.info(
+            "Skipping transcription - no significant audio detected",
+            {
+              voiceDetected: vadStats.voiceDetected,
+              speechDuration: vadStats.speechDuration,
+              peakLevel: vadStats.peakLevel,
+              minRequired: VAD_CONFIG.MIN_SPEECH_DURATION,
+            },
+            "vad"
+          );
+
+          // Reset state without processing
+          this.isProcessing = false;
+          this.onStateChange?.({ isRecording: false, isProcessing: false });
+
+          // Notify about no audio via callback (will trigger toast in hook)
+          this.onNoAudioDetected?.();
+
+          // Clean up stream
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        // We have valid audio, proceed with processing
+        this.isProcessing = true;
+        this.onStateChange?.({ isRecording: false, isProcessing: true });
+
+        await this.processAudio(audioBlob, { durationSeconds, vadStats });
 
         // Clean up stream
         stream.getTracks().forEach((track) => track.stop());
@@ -197,6 +376,9 @@ class AudioManager {
 
   cancelRecording() {
     if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
+      // Stop VAD monitoring first
+      this.stopVADMonitoring();
+
       this.mediaRecorder.onstop = () => {
         this.isRecording = false;
         this.isProcessing = false;
@@ -1416,13 +1598,28 @@ class AudioManager {
     };
   }
 
+  getVADState() {
+    return {
+      audioLevel: this.currentAudioLevel,
+      peakLevel: this.peakAudioLevel,
+      voiceDetected: this.voiceDetected,
+      speechDuration: this.speechDuration,
+      threshold: VAD_CONFIG.VOICE_THRESHOLD,
+    };
+  }
+
   cleanup() {
+    // Stop VAD monitoring if active
+    this.stopVADMonitoring();
+
     if (this.mediaRecorder?.state === "recording") {
       this.stopRecording();
     }
     this.onStateChange = null;
     this.onError = null;
     this.onTranscriptionComplete = null;
+    this.onVADStateChange = null;
+    this.onNoAudioDetected = null;
   }
 }
 

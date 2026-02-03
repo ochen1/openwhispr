@@ -1,12 +1,39 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import AudioManager from "../helpers/audioManager";
+
+// VAD state type for documentation
+// {
+//   audioLevel: number (0-1),
+//   peakLevel: number (0-1),
+//   voiceDetected: boolean,
+//   isVoiceActive: boolean,
+//   speechDuration: number (seconds)
+// }
 
 export const useAudioRecording = (toast, options = {}) => {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcript, setTranscript] = useState("");
+  const [vadState, setVadState] = useState({
+    audioLevel: 0,
+    peakLevel: 0,
+    voiceDetected: false,
+    isVoiceActive: false,
+    speechDuration: 0,
+  });
+  const [showNoAudioToast, setShowNoAudioToast] = useState(false);
   const audioManagerRef = useRef(null);
+  const noAudioTimeoutRef = useRef(null);
   const { onToggle } = options;
+
+  // Dismiss the no audio toast with robust cleanup
+  const dismissNoAudioToast = useCallback(() => {
+    setShowNoAudioToast(false);
+    if (noAudioTimeoutRef.current) {
+      clearTimeout(noAudioTimeoutRef.current);
+      noAudioTimeoutRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     audioManagerRef.current = new AudioManager();
@@ -15,6 +42,16 @@ export const useAudioRecording = (toast, options = {}) => {
       onStateChange: ({ isRecording, isProcessing }) => {
         setIsRecording(isRecording);
         setIsProcessing(isProcessing);
+        // Reset VAD state when not recording
+        if (!isRecording) {
+          setVadState({
+            audioLevel: 0,
+            peakLevel: 0,
+            voiceDetected: false,
+            isVoiceActive: false,
+            speechDuration: 0,
+          });
+        }
       },
       onError: (error) => {
         toast({
@@ -40,6 +77,24 @@ export const useAudioRecording = (toast, options = {}) => {
           }
         }
       },
+      onVADStateChange: (state) => {
+        setVadState(state);
+      },
+      onNoAudioDetected: () => {
+        // Show the no audio toast
+        setShowNoAudioToast(true);
+
+        // Clear any existing timeout
+        if (noAudioTimeoutRef.current) {
+          clearTimeout(noAudioTimeoutRef.current);
+        }
+
+        // Auto-dismiss after 2 seconds
+        noAudioTimeoutRef.current = setTimeout(() => {
+          setShowNoAudioToast(false);
+          noAudioTimeoutRef.current = null;
+        }, 2000);
+      },
     });
 
     // Set up hotkey listener for tap-to-talk mode
@@ -47,6 +102,8 @@ export const useAudioRecording = (toast, options = {}) => {
       const currentState = audioManagerRef.current.getState();
 
       if (!currentState.isRecording && !currentState.isProcessing) {
+        // Dismiss no audio toast when starting new recording
+        dismissNoAudioToast();
         audioManagerRef.current.startRecording();
       } else if (currentState.isRecording) {
         audioManagerRef.current.stopRecording();
@@ -57,6 +114,7 @@ export const useAudioRecording = (toast, options = {}) => {
     const handleStart = () => {
       const currentState = audioManagerRef.current.getState();
       if (!currentState.isRecording && !currentState.isProcessing) {
+        dismissNoAudioToast();
         audioManagerRef.current.startRecording();
       }
     };
@@ -100,14 +158,18 @@ export const useAudioRecording = (toast, options = {}) => {
       disposeStart?.();
       disposeStop?.();
       disposeNoAudio?.();
+      if (noAudioTimeoutRef.current) {
+        clearTimeout(noAudioTimeoutRef.current);
+      }
       if (audioManagerRef.current) {
         audioManagerRef.current.cleanup();
       }
     };
-  }, [toast, onToggle]);
+  }, [toast, onToggle, dismissNoAudioToast]);
 
   const startRecording = async () => {
     if (audioManagerRef.current) {
+      dismissNoAudioToast();
       return await audioManagerRef.current.startRecording();
     }
     return false;
@@ -139,6 +201,9 @@ export const useAudioRecording = (toast, options = {}) => {
     isRecording,
     isProcessing,
     transcript,
+    vadState,
+    showNoAudioToast,
+    dismissNoAudioToast,
     startRecording,
     stopRecording,
     cancelRecording,

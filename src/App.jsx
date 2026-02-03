@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import "./index.css";
-import { X } from "lucide-react";
+import { X, VolumeX } from "lucide-react";
 import { useToast } from "./components/ui/Toast";
 import { LoadingDots } from "./components/ui/LoadingDots";
 import { useHotkey } from "./hooks/useHotkey";
@@ -40,6 +40,93 @@ const VoiceWaveIndicator = ({ isListening }) => {
           }}
         />
       ))}
+    </div>
+  );
+};
+
+// Audio Level Visualizer Component - shows real-time mic activity during recording
+const AudioLevelVisualizer = ({ audioLevel, voiceDetected, isVoiceActive }) => {
+  // Normalize and scale the audio level for visual display (0-100%)
+  const normalizedLevel = Math.min(100, Math.max(0, audioLevel * 500));
+
+  return (
+    <div className="flex items-center justify-center gap-0.5">
+      {[...Array(5)].map((_, i) => {
+        // Each bar has a threshold - bars light up based on audio level
+        const barThreshold = (i + 1) * 20;
+        const isActive = normalizedLevel >= barThreshold;
+        const isPartiallyActive = normalizedLevel >= barThreshold - 10;
+
+        // Calculate dynamic height based on audio level
+        const baseHeight = 4;
+        const maxHeight = 16;
+        const heightPercent = isActive ? 1 : isPartiallyActive ? 0.5 : 0.3;
+        const height = baseHeight + (maxHeight - baseHeight) * heightPercent;
+
+        return (
+          <div
+            key={i}
+            className={`w-0.5 rounded-full transition-all duration-75 ${
+              voiceDetected && isActive
+                ? "bg-green-400"
+                : isVoiceActive && isPartiallyActive
+                  ? "bg-yellow-400"
+                  : "bg-white/40"
+            }`}
+            style={{
+              height: `${height}px`,
+              transform: isVoiceActive ? `scaleY(${0.8 + audioLevel * 2})` : "scaleY(1)",
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+};
+
+// No Audio Toast Component - popover that appears when recording has no audio
+const NoAudioToast = ({ isVisible, onDismiss }) => {
+  const toastRef = useRef(null);
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    // Handle click outside to dismiss
+    const handleClickOutside = (event) => {
+      if (toastRef.current && !toastRef.current.contains(event.target)) {
+        onDismiss();
+      }
+    };
+
+    // Handle escape key to dismiss
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        onDismiss();
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isVisible, onDismiss]);
+
+  if (!isVisible) return null;
+
+  return (
+    <div
+      ref={toastRef}
+      className="absolute bottom-full right-0 mb-3 animate-in fade-in slide-in-from-bottom-2 duration-200"
+      role="alert"
+      aria-live="polite"
+    >
+      <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-neutral-800/95 border border-white/10 shadow-lg backdrop-blur-sm">
+        <VolumeX size={14} className="text-yellow-400 flex-shrink-0" />
+        <span className="text-xs text-white/90 whitespace-nowrap">No audio detected</span>
+      </div>
     </div>
   );
 };
@@ -123,7 +210,15 @@ export default function App() {
     setWindowInteractivity(false);
   }, [setWindowInteractivity]);
 
-  const { isRecording, isProcessing, toggleListening, cancelRecording } = useAudioRecording(toast, {
+  const {
+    isRecording,
+    isProcessing,
+    toggleListening,
+    cancelRecording,
+    vadState,
+    showNoAudioToast,
+    dismissNoAudioToast,
+  } = useAudioRecording(toast, {
     onToggle: handleDictationToggle,
   });
 
@@ -154,7 +249,9 @@ export default function App() {
   useEffect(() => {
     const handleKeyPress = (e) => {
       if (e.key === "Escape") {
-        if (isCommandMenuOpen) {
+        if (showNoAudioToast) {
+          dismissNoAudioToast();
+        } else if (isCommandMenuOpen) {
           setIsCommandMenuOpen(false);
         } else {
           handleClose();
@@ -164,7 +261,7 @@ export default function App() {
 
     document.addEventListener("keydown", handleKeyPress);
     return () => document.removeEventListener("keydown", handleKeyPress);
-  }, [isCommandMenuOpen]);
+  }, [isCommandMenuOpen, showNoAudioToast, dismissNoAudioToast]);
 
   // Determine current mic state
   const getMicState = () => {
@@ -176,34 +273,48 @@ export default function App() {
 
   const micState = getMicState();
 
+  // Get recording tooltip with VAD status
+  const getRecordingTooltip = () => {
+    if (vadState.voiceDetected) {
+      return "Voice detected - recording...";
+    }
+    return "Listening... speak now";
+  };
+
   const getMicButtonProps = () => {
     const baseClasses =
-      "rounded-full w-10 h-10 flex items-center justify-center relative overflow-hidden border-2 border-white/70 cursor-pointer";
+      "rounded-full w-10 h-10 flex items-center justify-center relative overflow-hidden border-2 cursor-pointer";
 
     switch (micState) {
       case "idle":
         return {
-          className: `${baseClasses} bg-black/50 cursor-pointer`,
+          className: `${baseClasses} bg-black/50 border-white/70`,
           tooltip: `Press [${hotkey}] to speak`,
         };
       case "hover":
         return {
-          className: `${baseClasses} bg-black/50 cursor-pointer`,
+          className: `${baseClasses} bg-black/50 border-white/70`,
           tooltip: `Press [${hotkey}] to speak`,
         };
       case "recording":
+        // Change border color based on VAD status
+        const borderColor = vadState.voiceDetected
+          ? "border-green-400"
+          : vadState.isVoiceActive
+            ? "border-yellow-400"
+            : "border-blue-300";
         return {
-          className: `${baseClasses} bg-blue-600 cursor-pointer`,
-          tooltip: "Recording...",
+          className: `${baseClasses} bg-blue-600 ${borderColor}`,
+          tooltip: getRecordingTooltip(),
         };
       case "processing":
         return {
-          className: `${baseClasses} bg-purple-600 cursor-not-allowed`,
+          className: `${baseClasses} bg-purple-600 border-purple-300 cursor-not-allowed`,
           tooltip: "Processing...",
         };
       default:
         return {
-          className: `${baseClasses} bg-black/50 cursor-pointer`,
+          className: `${baseClasses} bg-black/50 border-white/70`,
           style: { transform: "scale(0.8)" },
           tooltip: "Click to speak",
         };
@@ -229,6 +340,9 @@ export default function App() {
             }
           }}
         >
+          {/* No Audio Toast */}
+          <NoAudioToast isVisible={showNoAudioToast} onDismiss={dismissNoAudioToast} />
+
           {isRecording && isHovered && (
             <Tooltip content="Cancel recording">
               <button
@@ -294,7 +408,7 @@ export default function App() {
                       ? "grabbing !important"
                       : "pointer !important",
                 transition:
-                  "transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.25s ease-out",
+                  "transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.25s ease-out, border-color 0.15s ease-out",
               }}
             >
               {/* Background effects */}
@@ -313,14 +427,29 @@ export default function App() {
               {micState === "idle" || micState === "hover" ? (
                 <SoundWaveIcon size={micState === "idle" ? 12 : 14} />
               ) : micState === "recording" ? (
-                <LoadingDots />
+                <AudioLevelVisualizer
+                  audioLevel={vadState.audioLevel}
+                  voiceDetected={vadState.voiceDetected}
+                  isVoiceActive={vadState.isVoiceActive}
+                />
               ) : micState === "processing" ? (
                 <VoiceWaveIndicator isListening={true} />
               ) : null}
 
-              {/* State indicator ring for recording */}
+              {/* State indicator ring for recording - changes based on VAD */}
               {micState === "recording" && (
-                <div className="absolute inset-0 rounded-full border-2 border-blue-300 animate-pulse"></div>
+                <div
+                  className={`absolute inset-0 rounded-full border-2 transition-colors duration-150 ${
+                    vadState.voiceDetected
+                      ? "border-green-300 opacity-80"
+                      : "border-blue-300 animate-pulse"
+                  }`}
+                ></div>
+              )}
+
+              {/* Voice detected indicator glow */}
+              {micState === "recording" && vadState.voiceDetected && (
+                <div className="absolute inset-0 rounded-full bg-green-400/20 animate-pulse"></div>
               )}
 
               {/* State indicator ring for processing */}
